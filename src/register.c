@@ -544,3 +544,33 @@ int io_uring_register_query(struct io_uring_query_hdr *query)
 {
 	return __sys_io_uring_register(-1, IORING_REGISTER_QUERY, query, 0);
 }
+
+int io_uring_register_spare(struct io_uring *ring, struct io_uring_spare_reg *reg)
+{
+	int ret = do_register(ring, IORING_REGISTER_SPARE, reg, 1);
+
+	if (!ret) {
+		if (reg->features & IORING_SPARE_FEAT_PULL) {
+			__io_uring_spare_init();
+			ring->int_flags |= INT_FLAG_SPARE_PULL;
+		} else {
+			ring->int_flags &= ~INT_FLAG_SPARE_PULL;
+		}
+	}
+	return ret;
+}
+
+int io_uring_unregister_spare(struct io_uring *ring)
+{
+	int ret = do_register(ring, IORING_UNREGISTER_SPARE, NULL, 0);
+
+	if (!ret)
+		ring->int_flags &= ~INT_FLAG_SPARE_PULL;
+	return ret;
+}
+
+int io_uring_register_spare_debug(struct io_uring *ring,
+				  struct io_uring_spare_debug *dbg)
+{
+	return do_register(ring, IORING_REGISTER_SPARE_DEBUG, dbg, 1);
+}

@@ -1,0 +1,396 @@
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_register_spare 3 "October 23, 2026" "liburing-2.17" "liburing Manual"
+.SH NAME
+io_uring_register_spare, io_uring_unregister_spare, io_uring_register_spare_debug \- manage a SpareRing executor group
+.SH SYNOPSIS
+.nf
+.B #include <liburing.h>
+.PP
+.BI "int io_uring_register_spare(struct io_uring *" ring ","
+.BI "                            struct io_uring_spare_reg *" reg ");"
+.PP
+.BI "int io_uring_unregister_spare(struct io_uring *" ring ");"
+.PP
+.BI "int io_uring_register_spare_debug(struct io_uring *" ring ","
+.BI "                                  struct io_uring_spare_debug *" dbg ");"
+.fi
+.SH DESCRIPTION
+SpareRing v5.14 is a research prototype and is not part of upstream Linux.
+These functions require a kernel implementing the prototype.
+.PP
+.BR io_uring_register_spare (3)
+attaches
+.I ring
+to a group of spare executors. Eligible runs of SQEs can be delegated to
+these executors. With the pull feature enabled, an executor may lease the
+SQ and consume eligible SQEs after the application publishes them. The
+submitting task takes over when necessary, preserving the ring's
+.B IORING_SETUP_DEFER_TASKRUN
+completion discipline.
+.PP
+The argument pointed to by
+.I reg
+has the following layout:
+.PP
+.in +4n
+.EX
+struct io_uring_spare_reg {
+	__s32	attach_fd;
+	__u32	nr_exec;
+	__u32	n_max;
+	__u32	u_pending;
+	__u32	u_chunks;
+	__u32	linger_us;
+	__u32	mode;
+	__u32	flags;
+	__u64	cpumask;
+	__u32	cpumask_len;
+	__u32	n_min;
+	__u32	rescue_us;
+	__u32	features;
+};
+.EE
+.in
+.TP
+.I attach_fd
+Set to -1 to create a new executor group. Otherwise, this must be a file
+descriptor for an io_uring instance already attached to a group. The group
+must belong to the caller's thread group; joining a group from another
+thread group fails with
+.BR -EPERM .
+.TP
+.I nr_exec
+Number of executors to create for a new group, from 1 through 64.
+This field is used only when creating a group.
+.TP
+.I n_max
+Maximum number of SQEs in a delegated chunk or pull unit. Zero selects
+the default of 32; the maximum is 64.
+.TP
+.I u_pending
+Maximum number of unclaimed push chunks for this ring. Zero selects the
+default of 4.
+.TP
+.I u_chunks
+Maximum number of outstanding chunks, including unclaimed and claimed
+chunks, for this ring. Zero selects the default of 16.
+.TP
+.I linger_us
+Time in microseconds that an executor polls for work before sleeping. Zero
+selects the default of 50; the maximum is 1000.
+.TP
+.I mode
+One of the modes described below.
+.TP
+.I flags
+Bitwise OR of the flags described below.
+.TP
+.I cpumask
+User address of a CPU bitmap for a new executor group, stored in a
+64-bit integer. Zero allows any CPU. This field is used only when
+creating a group.
+.TP
+.I cpumask_len
+Size in bytes of the bitmap pointed to by
+.IR cpumask .
+.TP
+.I n_min
+Minimum eligible backlog needed to delegate work or acquire an SQ lease.
+Zero selects the default of 16, capped at
+.IR n_max .
+.TP
+.I rescue_us
+Rescue timer interval in microseconds. Zero selects 1000; nonzero values
+are clamped to the range 10 through 100000. Without preemption notifiers,
+the timer interval is at most 100 microseconds.
+.TP
+.I features
+Output feature bits enabled for this ring. The input value is ignored.
+.B IORING_SPARE_FEAT_PULL
+indicates that pull leases are enabled. Liburing uses this bit to select
+its pull submission path. The kernel copies this field to the caller
+before publishing the attachment; if that copy fails, registration fails
+with
+.B -EFAULT
+and the ring remains unattached. The structure remains 56 bytes;
+.I rescue_us
+and
+.I features
+occupy offsets 48 and 52, respectively.
+.SS Flags
+.TP
+.B IORING_SPARE_F_NO_SPLIT
+Restrict wait-time splitting to chunks of stalled executors.
+.TP
+.B IORING_SPARE_F_OWNER_POST
+Disable direct completion publication by executors.
+.TP
+.B IORING_SPARE_F_NO_ACCUMULATE
+Disable accumulation of push work.
+.TP
+.B IORING_SPARE_F_NO_BLOCK
+Accepted for compatibility; it matches the v5.14 default behavior.
+.TP
+.B IORING_SPARE_F_FIXED_NMIN
+Keep the delegation threshold constant.
+.TP
+.B IORING_SPARE_F_NO_PULL
+Disable pull leases and retain push delegation.
+.TP
+.B IORING_SPARE_F_EXEC_BLOCK
+Enable blocking retries in executor context.
+.TP
+.B IORING_SPARE_F_EXEC_FINISH
+Request the optional executor finishing path while the owner waits.
+.TP
+.B IORING_SPARE_F_NO_TIER
+Wake executors without considering CPU tiers.
+.TP
+.B IORING_SPARE_F_NO_NOTIFIER
+Disable preemption notifiers and use timer-based rescue.
+.SS Modes
+.TP
+.B IORING_SPARE_MODE_AUTO (0)
+Adaptively delegate eligible runs according to the available executor
+capacity and pending work.
+.TP
+.B IORING_SPARE_MODE_ALWAYS (1)
+Delegate every eligible run, waking executors as needed, subject to the
+chunk limits.
+.TP
+.B IORING_SPARE_MODE_NEVER (2)
+Keep the ring attached to the group, but never delegate SQEs. The resource
+freeze described below still applies.
+.SS Registration rules
+The ring must have all of
+.BR IORING_SETUP_SINGLE_ISSUER ,
+.BR IORING_SETUP_DEFER_TASKRUN ,
+and
+.BR IORING_SETUP_SUBMIT_ALL
+set. It must not have any of
+.BR IORING_SETUP_IOPOLL ,
+.BR IORING_SETUP_SQPOLL ,
+.BR IORING_SETUP_CQE32 ,
+.BR IORING_SETUP_SQE128 ,
+.BR IORING_SETUP_SQ_REWIND ,
+.BR IORING_SETUP_SQ_SHARED ,
+or
+.BR IORING_SETUP_CQE_MIXED
+set. No BPF filter may be installed on the ring. Registration must be
+performed by the ring's submitting task, as required by
+.BR IORING_SETUP_SINGLE_ISSUER .
+A ring already attached to a group cannot be registered again;
+this fails with
+.BR -EBUSY .
+Invalid settings, including unsupported
+.I flags
+bits, fail with
+.BR -EINVAL .
+.PP
+Pull leases additionally require
+.B IORING_SETUP_NO_SQARRAY
+and
+.BR IORING_SETUP_TASKRUN_FLAG ,
+with
+.B IORING_SPARE_F_NO_PULL
+clear. Otherwise registration succeeds with push delegation only and
+.B IORING_SPARE_FEAT_PULL
+clear. Liburing normally requests
+.B IORING_SETUP_NO_SQARRAY
+when creating a ring. The mode controls whether work is offered;
+.B IORING_SPARE_MODE_NEVER
+does not offer a lease even if the feature bit is present.
+.PP
+The underlying
+.B IORING_REGISTER_SPARE
+operation takes this structure as its argument and requires
+.I nr_args
+to be 1. The liburing helper supplies this value.
+.SS Eligible operations
+Only
+.BR IORING_OP_READ ,
+.BR IORING_OP_WRITE ,
+.BR IORING_OP_READ_FIXED ,
+and
+.B IORING_OP_WRITE_FIXED
+are eligible for delegation. An SQE may have
+.B IOSQE_FIXED_FILE
+and
+.B IOSQE_ASYNC
+set, but no other SQE flags, and must have zero
+.I personality
+and
+.IR attr_type_mask .
+Linked or drained SQEs, vectored I/O, and operations with indirect input
+descriptors are handled by the normal submission path. Eligibility does
+not change the application's obligation to keep I/O buffers valid until
+completion.
+.PP
+The file offset must not be -1. Writes require an infinite
+.B RLIMIT_FSIZE
+for the library to skip submission entry. The library samples this limit
+at registration. A later limit change can cause an extra kernel entry;
+the kernel checks eligibility again and hands the lease back with
+.B IORING_SQ_TASKRUN
+set when necessary. File properties and fixed-resource validity are
+checked by the kernel.
+.SS Pull submission
+For a pull ring, liburing publishes the SQ tail with release ordering and
+reads the SQ head with acquire ordering. After publication it may skip
+the submission syscall only when
+.B IORING_SQ_LEASED
+is set, neither
+.B IORING_SQ_TASKRUN
+nor
+.B IORING_SQ_CQ_OVERFLOW
+is set, the SQ has free space, and every unconsumed SQE is eligible.
+The submitting task must be the only SQ producer. Published SQEs must
+remain unchanged until the SQ head passes them; I/O buffers remain valid
+until completion.
+.PP
+The submitted count is the published SQ tail minus the head observed by
+the library. It may include SQEs still pending from an earlier call.
+If entry is skipped, the submission helper returns the submitted count.
+If waiting still requires entry, liburing enters with zero submissions
+and
+.BR IORING_ENTER_GETEVENTS ;
+it returns a negative error or, on success, the submitted count. When
+liburing enters with a nonzero submission count, it returns the kernel's
+submission result, including short results. This accounting also applies
+to the timeout and registered-wait submission helpers. A raw zero-submit
+entry returns zero. For pull rings, a raw nonzero submission entry also
+accounts for SQEs already consumed by the lessee; it may still return
+short or
+.B -EAGAIN
+if the owner cannot allocate requests for remaining work.
+.SS Resource freeze
+While attached, fixed file and buffer tables cannot change
+.RB ( -EBUSY ).
+Register fixed files and buffers before attaching the ring, even in
+.BR IORING_SPARE_MODE_NEVER .
+The freeze covers registering, unregistering, updating, and cloning into
+these tables, changing the fixed file allocation range, and registering a
+BPF filter. It also covers operations that install or remove direct file
+descriptors, including incoming
+.B IORING_MSG_SEND_FD
+messages, and kernel buffer registration and unregistration.
+.PP
+.BR io_uring_unregister_spare (3)
+detaches the ring from its group. The resource freeze persists after
+detachment while any delegated chunk remains outstanding. Drive and drain
+outstanding completions before changing the tables; such changes can
+continue to return
+.B -EBUSY
+until the chunks have been retired.
+.PP
+The underlying
+.B IORING_UNREGISTER_SPARE
+operation requires a NULL argument and
+.I nr_args
+of 0. The liburing helper supplies these values.
+.SS Debug operation
+.BR io_uring_register_spare_debug (3)
+passes the in/out
+.I dbg
+argument to
+.B IORING_REGISTER_SPARE_DEBUG
+(opcode 40), with
+.I nr_args
+equal to 1. The kernel must have
+.B CONFIG_IO_URING_SPARE_DEBUG
+enabled; otherwise the operation returns
+.BR -EINVAL .
+The 32-byte
+.B io_uring_spare_debug
+structure contains 32-bit
+.IR point ,
+.IR action ,
+.IR count ,
+.IR usec ,
+.IR slot ,
+and output
+.I hits
+fields, followed by a 64-bit
+.I resv
+field that must be zero. Points and actions are defined by
+.B enum io_uring_spare_dbg_point
+and
+.BR enum io_uring_spare_dbg_action .
+Use
+.B IORING_SPARE_DBG_QUERY
+to inspect a point,
+.B IORING_SPARE_DBG_RELEASE
+to release a parked executor, and
+.B IORING_SPARE_DBG_DISARM
+to disarm it. An arm action fires at most
+.I count
+times. A zero
+.I usec
+parks an executor until release, subject to the kernel's 10-second cap;
+owner-side parking requires a nonzero duration. Debug controls must be
+issued by the ring's submitting task.
+.SH RETURN VALUE
+On success, these functions return 0. On failure, they return a negative
+error code.
+.SH ERRORS
+.TP
+.B -EINVAL
+The kernel does not implement SpareRing, the ring is incompatible, or the
+registration arguments are invalid.
+.TP
+.B -EOPNOTSUPP
+The kernel does not support the requested SpareRing operation.
+.TP
+.B -EBUSY
+The ring is already attached to a group, or outstanding work prevents
+the requested change.
+.TP
+.B -EPERM
+The executor group named by
+.I attach_fd
+belongs to a different thread group.
+.TP
+.B -ENOMEM
+Insufficient memory to create the executor group or attachment.
+.TP
+.B -EFAULT
+An argument or CPU bitmap address is invalid, or the feature output is
+not writable.
+.SH EXAMPLES
+.in +4n
+.EX
+struct io_uring ring;
+struct io_uring_spare_reg reg = {
+	.attach_fd = -1,
+	.nr_exec = 2,
+	.mode = IORING_SPARE_MODE_ALWAYS,
+};
+unsigned int flags = IORING_SETUP_SINGLE_ISSUER |
+		     IORING_SETUP_DEFER_TASKRUN |
+		     IORING_SETUP_SUBMIT_ALL |
+		     IORING_SETUP_TASKRUN_FLAG;
+int ret;
+
+ret = io_uring_queue_init(256, &ring, flags);
+if (ret)
+	return ret;
+/* Register any fixed files and buffers here, before attaching. */
+ret = io_uring_register_spare(&ring, &reg);
+if (ret) {
+	io_uring_queue_exit(&ring);
+	return ret;
+}
+/* Submit I/O and consume completions here. */
+ret = io_uring_unregister_spare(&ring);
+/* Drain outstanding I/O before changing fixed resource tables. */
+io_uring_queue_exit(&ring);
+return ret;
+.EE
+.in
+.SH SEE ALSO
+.BR io_uring_setup (2),
+.BR io_uring_register (2),
+.BR io_uring_register_files (3),
+.BR io_uring_register_buffers (3),
+.BR io_uring_submit (3)

@@ -8,6 +8,84 @@
 #include "liburing/sanitize.h"
 #include "liburing/io_uring.h"
 
+_Static_assert(INT_FLAG_SPARE_PULL == LIBURING_INT_FLAG_SPARE_PULL,
+	       "public and internal spare pull flags must match");
+_Static_assert(sizeof(struct io_uring_spare_reg) == 56,
+	       "spare registration ABI size");
+_Static_assert(offsetof(struct io_uring_spare_reg, rescue_us) == 48 &&
+	       offsetof(struct io_uring_spare_reg, features) == 52,
+	       "spare registration ABI offsets");
+_Static_assert(sizeof(struct io_uring_spare_debug) == 32,
+	       "spare debug ABI size");
+
+static bool spare_fsize_infinite;
+
+void __io_uring_spare_init(void)
+{
+	struct rlimit rlim;
+	bool infinite = !__sys_getrlimit(RLIMIT_FSIZE, &rlim) &&
+			rlim.rlim_cur == RLIM_INFINITY;
+
+	/*
+	 * Sample once at registration, rather than on every submission. A later
+	 * setrlimit only costs an extra enter: the kernel hands the lease back
+	 * at an ineligible write and sets TASKRUN. Concurrent ring registrations
+	 * may refresh this process-wide hint, so access it atomically.
+	 */
+	__atomic_store_n(&spare_fsize_infinite, infinite, __ATOMIC_RELAXED);
+}
+
+static bool spare_sq_eligible(struct io_uring *ring)
+{
+	struct io_uring_sq *sq = &ring->sq;
+	unsigned head = io_uring_smp_load_acquire(sq->khead);
+	unsigned tail = sq->sqe_tail;
+	unsigned i;
+
+	/* Pull registrations require NO_SQARRAY. Include short-submit leftovers. */
+	for (i = head; i != tail; i++) {
+		const struct io_uring_sqe *sqe = &sq->sqes[i & sq->ring_mask];
+
+		switch (sqe->opcode) {
+		case IORING_OP_WRITE:
+		case IORING_OP_WRITE_FIXED:
+			if (!__atomic_load_n(&spare_fsize_infinite, __ATOMIC_RELAXED))
+				return false;
+			/* fall through */
+		case IORING_OP_READ:
+		case IORING_OP_READ_FIXED:
+			break;
+		default:
+			return false;
+		}
+		/* The kernel's table (io_spare_eligible(), io_exec_pull_alloc()). */
+		if ((sqe->flags & ~(IOSQE_FIXED_FILE | IOSQE_ASYNC)) ||
+		    sqe->personality || sqe->attr_ptr || sqe->attr_type_mask ||
+		    sqe->off == (__u64) -1)
+			return false;
+	}
+	return true;
+}
+
+static bool spare_pull_skip(struct io_uring *ring, unsigned submitted)
+{
+	unsigned kf;
+
+	/* Publish tail before observing the lease (paired with kernel handback). */
+	io_uring_smp_mb();
+	kf = IO_URING_READ_ONCE(*ring->sq.kflags);
+	/*
+	 * IORING_SQ_TASKRUN only asks the owner to enter and run task_work. The
+	 * callers do that with to_submit = 0 (cq_ring_needs_enter()), which keeps
+	 * the lease; entering with the SQEs would make the kernel take the lease
+	 * over on every batch (SpareRing perf round 1: 474k takeovers / 526k
+	 * acquisitions in 30 s). Only an overflowed CQ forces a full enter.
+	 */
+	return submitted && (kf & IORING_SQ_LEASED) &&
+		!(kf & IORING_SQ_CQ_OVERFLOW) &&
+		io_uring_sq_space_left(ring) && spare_sq_eligible(ring);
+}
+
 /*
  * Returns true if we're not using SQ thread (thus nobody submits but us)
  * or if IORING_SQ_NEED_WAKEUP is set, so submit thread must be explicitly
@@ -69,6 +147,7 @@ static int _io_uring_get_cqe(struct io_uring *ring,
 
 	do {
 		bool need_enter = false;
+		bool pull_skip;
 		unsigned flags = ring_enter_flags(ring);
 		unsigned nr_available;
 		int ret;
@@ -96,10 +175,18 @@ static int _io_uring_get_cqe(struct io_uring *ring,
 			flags |= IORING_ENTER_GETEVENTS | data->get_flags;
 			need_enter = true;
 		}
-		if (sq_ring_needs_enter(ring, data->submit, &flags))
+		pull_skip = (ring->int_flags & INT_FLAG_SPARE_PULL) &&
+			    spare_pull_skip(ring, data->submit);
+		if (!pull_skip && sq_ring_needs_enter(ring, data->submit, &flags))
 			need_enter = true;
-		if (!need_enter)
+		if (!need_enter) {
+			if (pull_skip) {
+				if (!looped)
+					err = data->submit;
+				data->submit = 0;
+			}
 			break;
+		}
 		if (looped && data->has_ts) {
 			/*
 			 * When IORING_ENTER_EXT_ARG_REG is set, data->arg
@@ -121,7 +208,8 @@ static int _io_uring_get_cqe(struct io_uring *ring,
 			break;
 		}
 
-		ret = __sys_io_uring_enter2(ring->enter_ring_fd, data->submit,
+		ret = __sys_io_uring_enter2(ring->enter_ring_fd,
+					    pull_skip ? 0 : data->submit,
 					    data->wait_nr, flags, data->arg,
 					    data->sz);
 		if (ret < 0) {
@@ -130,7 +218,15 @@ static int _io_uring_get_cqe(struct io_uring *ring,
 			break;
 		}
 
-		data->submit -= ret;
+		if (pull_skip) {
+			/* A zero-submit GETEVENTS enter does not report pulled SQEs. */
+			ret = data->submit;
+			data->submit = 0;
+		} else {
+			data->submit -= ret;
+		}
+		if ((ring->int_flags & INT_FLAG_SPARE_PULL) && !looped)
+			err = ret;
 		if (cqe)
 			break;
 		if (!looped) {
@@ -266,18 +362,19 @@ static unsigned __io_uring_flush_sq(struct io_uring *ring)
 		/*
 		 * Ensure kernel sees the SQE updates before the tail update.
 		 */
-		if (!(ring->flags & IORING_SETUP_SQPOLL))
+		if (!(ring->flags & IORING_SETUP_SQPOLL) &&
+		    !(ring->int_flags & INT_FLAG_SPARE_PULL))
 			*sq->ktail = tail;
 		else
 			io_uring_smp_store_release(sq->ktail, tail);
 	}
 	/*
-	* This load needs to be atomic, since sq->khead is written concurrently
-	* by the kernel, but it doesn't need to be load_acquire, since the
-	* kernel doesn't store to the submission queue; it advances khead just
-	* to indicate that it's finished reading the submission queue entries
-	* so they're available for us to write to.
-	*/
+	 * Pull consumers publish head with release; pair it before reusing SQEs.
+	 * Other rings retain their existing atomic head load: the kernel only
+	 * advances head to indicate that it has finished reading the SQEs.
+	 */
+	if (ring->int_flags & INT_FLAG_SPARE_PULL)
+		return tail - io_uring_smp_load_acquire(sq->khead);
 	return tail - IO_URING_READ_ONCE(*sq->khead);
 }
 
@@ -485,6 +582,22 @@ static int __io_uring_submit(struct io_uring *ring, unsigned submitted,
 	int ret;
 
 	liburing_sanitize_ring(ring);
+
+	if (ring->int_flags & INT_FLAG_SPARE_PULL) {
+		/* As sq_ring_needs_enter() for a ring we drive: nothing to do. */
+		if (!submitted && !cq_needs_enter)
+			return 0;
+		if (spare_pull_skip(ring, submitted)) {
+			if (!cq_needs_enter)
+				return submitted;
+			ret = __sys_io_uring_enter(ring->enter_ring_fd, 0, wait_nr,
+					 flags | IORING_ENTER_GETEVENTS, NULL);
+			return ret < 0 ? ret : (int) submitted;
+		}
+		return __sys_io_uring_enter(ring->enter_ring_fd, submitted,
+				wait_nr, flags | (cq_needs_enter ?
+				IORING_ENTER_GETEVENTS : 0), NULL);
+	}
 
 	if (sq_ring_needs_enter(ring, submitted, &flags) || cq_needs_enter) {
 		if (cq_needs_enter)

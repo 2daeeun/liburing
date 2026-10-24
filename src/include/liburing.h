@@ -367,6 +367,12 @@ int io_uring_register_bpf_filter_task(struct io_uring_bpf *bpf)
 
 int io_uring_register_query(struct io_uring_query_hdr *query) LIBURING_NOEXCEPT;
 
+int io_uring_register_spare(struct io_uring *ring, struct io_uring_spare_reg *reg)
+	LIBURING_NOEXCEPT;
+int io_uring_unregister_spare(struct io_uring *ring) LIBURING_NOEXCEPT;
+int io_uring_register_spare_debug(struct io_uring *ring,
+				  struct io_uring_spare_debug *dbg) LIBURING_NOEXCEPT;
+
 int io_uring_get_events(struct io_uring *ring) LIBURING_NOEXCEPT;
 int io_uring_submit_and_get_events(struct io_uring *ring) LIBURING_NOEXCEPT;
 
@@ -1715,6 +1721,8 @@ IOURINGINLINE void io_uring_prep_pipe_direct(struct io_uring_sqe *sqe, int *fds,
 	__io_uring_set_target_fixed_file(sqe, file_index);
 }
 
+#define LIBURING_INT_FLAG_SPARE_PULL 8
+
 /* Read the kernel's SQ head index with appropriate memory ordering */
 IOURINGINLINE unsigned io_uring_load_sq_head(const struct io_uring *ring)
 	LIBURING_NOEXCEPT
@@ -1722,9 +1730,10 @@ IOURINGINLINE unsigned io_uring_load_sq_head(const struct io_uring *ring)
 	/*
 	 * Without acquire ordering, we could overwrite a SQE before the kernel
 	 * finished reading it. We don't need the acquire ordering for
-	 * non-SQPOLL since then we drive updates.
+	 * rings without SQPOLL or spare pull since then we drive updates.
 	 */
-	if (ring->flags & IORING_SETUP_SQPOLL)
+	if ((ring->flags & IORING_SETUP_SQPOLL) ||
+	    (ring->int_flags & LIBURING_INT_FLAG_SPARE_PULL))
 		return io_uring_smp_load_acquire(ring->sq.khead);
 
 	return *ring->sq.khead;

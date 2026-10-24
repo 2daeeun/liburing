@@ -11,7 +11,10 @@ enum {
 	INT_FLAG_REG_REG_RING	= 1,
 	INT_FLAG_APP_MEM	= 2,
 	INT_FLAG_CQ_ENTER	= 4,
+	INT_FLAG_SPARE_PULL	= 8,
 };
+
+void __io_uring_spare_init(void);
 
 static inline int ring_enter_flags(struct io_uring *ring)
 {

@@ -281,3 +281,10 @@ LIBURING_2.16 {
 		io_uring_buf_ring_head;
 		io_uring_prep_cmd_zone_reset_all;
 } LIBURING_2.15;
+
+LIBURING_2.17 {
+	global:
+		io_uring_register_spare;
+		io_uring_unregister_spare;
+		io_uring_register_spare_debug;
+} LIBURING_2.16;

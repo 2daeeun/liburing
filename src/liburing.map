@@ -146,3 +146,14 @@ LIBURING_2.15 {
 		io_uring_register_zcrx_ctrl;
 		io_uring_register_query;
 } LIBURING_2.14;
+
+LIBURING_2.16 {
+
+} LIBURING_2.15;
+
+LIBURING_2.17 {
+	global:
+		io_uring_register_spare;
+		io_uring_unregister_spare;
+		io_uring_register_spare_debug;
+} LIBURING_2.16;
